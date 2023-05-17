@@ -1,0 +1,276 @@
+import mysql.connector
+import datetime, random, sys
+import time
+import signal
+import warnings
+import collections
+
+warnings.simplefilter(action="ignore", category=FutureWarning)
+
+
+#
+# 이 프로그램은 200대의 키오스크 현재 상태를 20분 간격으로 업데이트 한다.
+# 시뮬레이션에서는 2%(4대)에서 고장(E001~E012)이 발생하고, 3시간 후 복구된다고 가정한다.
+# 고장 이력이 있어야 하므로 INSERT 방식으로 레코드를 삽입한다.
+# 여기서는 최초 상태만 기록한다.
+#
+# 1. 최종 키오스크 상태를 찾는다.
+#   max(kc_alarm_datetime)  먼저 각 키오스크의 최총 업데이트 시각을 찾고,
+#   이때 각 키오스크의 id, alarm_code, alarm_datetime을 출력한다.
+#   어떤 이유든 같은 시각에 2개 이상의 레코드가 존재하면
+#   MAX 함수에 의해서 하나만 선택된다.
+#
+# 2. 200대의 키오스크 중 최대 2%, 즉, 4대까지 고장이 발생한 것으로 한다.
+#   2.1.    4대 미만의 경우 4대까지 고장을 발생시킨다.
+#   2.2.    5대 이상 발생한 키오스크는 즉시 수리한다!
+#
+# 3. 장애 발생 상태가 3시간 경과한 것은 무조건 정상 상태로 복구시킨다.
+#       정상인 키오스크는 계속 상태를 업데이트 시킨다. 즉, 장애가 발생하지 않으면
+#       kc_alarm_datetime은 상상 최신 상태로 시간만 업데이트되고,
+#       따라서 장애 상태 레코드가 없다. 그러나 장애 이력을 확인하기 위하여
+#       장애가 있던 상태 레코드는 추가되고 유지된다.
+#
+# 4. 장애 발생 상태가 아닌 키오스크는 모두 현재 시각으로 E000 코드로 업데이트한다.
+#   4.1. 한 번이라도 장애를 발생시킨 키오스크는 장애 기록을 제외하고 최종 상태만
+#        업데이트해야 한다(장애 이력 기록을 위하여).
+#
+# 5. 20분 간격으로 업데이트한다.
+#
+
+alarm_tmp = (
+    "알람 없음,상부 DOOR OPEN,하부 DOOR OPEN,투입부 DOOR OPEN ERROR,투입부 DOOR CLOSE ERROR,"
+    + "파쇄부 DOOR OPEN ERROR,파쇄부 DOOR CLOSE ERROR,파쇄모터 과부하 ERROR,컨베이어 구동 ERROR,"
+    + "카메라 동작 ERROR,INPUT 통신 ERROR,OUTPUT 통신 ERROR,CAS 저울 통신 ERROR"
+)
+alarm_msg = alarm_tmp.split(",")
+
+alarm_tmp = (
+    "알람이 초기화되어 정상 가동한 상태,상부(판넬부) DOOR가 열려있는지 점검,"
+    + "하부(판넬부) DOOR가 열려있는지 점검,투입부 DOOR OPEN 감지센서 및 모터 구동 상태 점검,"
+    + "투입부 DOOR CLOSE 감지센서 및 모터 구동 상태 점검,파쇄부 DOOR OPEN 감지센서 및 모터 구동 상태 점검,"
+    + "파쇄부 DOOR CLOSE 감지센서 및 모터 구동 상태 점검,파쇄모터 과부하 발생으로 이물질 끼임 상태 점검,"
+    + "컨베이어 물체 감지 센서 및 모터 구동 상태 점검,카메라 동작 상태 점검,"
+    + "INPUT 모듈 통신 배선 및 통신 연결 상태 점검,OUTPUT 모듈 통신 배선 및 통신 연결 상태 점검,"
+    + "CAS 저울 통신 배선 및 통신 연결 상태 점검"
+)
+alarm_content = alarm_tmp.split(",")
+
+
+def error_msg(ks: int):
+    """
+    키오스크 얼람 메시지 및 내용
+    ks 0~12(E00~E12)
+    """
+    global alarm_msg, alarm_content
+    return alarm_msg[ks], alarm_content[ks]
+
+
+# CTRL-C 키에 의한 프로그램 종료시 DB Connector를 닫아준다.
+def signal_handler(sig, frame):
+    """
+    CTRL-C Handler
+    """
+    try:
+        mycursor.close()
+    except:
+        pass
+    sys.exit("CTRL-C 키를 눌렀습니다...DB Connector Close...종료")
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+# plastichero1 DB 접속
+plastichero1 = mysql.connector.connect(
+    host="localhost", user="root", password="m-road_0415", database="plastichero1"
+)
+mycursor = plastichero1.cursor()
+
+
+while True:
+    # 1. 최종 키오스크 상태를 찾는다.
+    #   max(kc_alarm_datetime)  먼저 각 키오스크의 최총 업데이트 시각을 찾고,
+    #   이때 각 키오스크의 id, alarm_code, alarm_datetime을 출력한다.
+    #   어떤 이유든 같은 시각에 2개 이상의 레코드가 존재하면
+    #   MAX 함수에 의해서 하나만 선택된다.
+    query = (
+        "SELECT kc_kiosk_id, MAX(kc_alarm_datetime) "
+        + "FROM g5_kiosk_status GROUP BY kc_kiosk_id "
+        + "ORDER BY kc_kiosk_id;"
+    )
+    mycursor.execute(query)
+    mk_res = mycursor.fetchall()
+    print(f"1. {len(mk_res)} records extracted with the following query:\n{query}")
+
+    mal_kiosks = []  # 고장 발생 키오스크 id, alarm_code, alarm_datetime
+    print(f"2. {mal_kiosks}")
+    for mk in mk_res:
+        # 어떤 이유든 같은 시각에 2개 이상의 레코드가 존재하면
+        # kc_alarm_code 값이 'E000'이 아닌 것들을 선택한다.
+        query = (
+            "SELECT kc_kiosk_id, kc_alarm_code, kc_alarm_datetime "
+            + f"FROM g5_kiosk_status WHERE kc_kiosk_id = '{mk[0]}' AND "
+            + f"kc_alarm_datetime = '{mk[1]}' "
+            + "ORDER BY kc_no DESC LIMIT 1;"
+        )
+        mycursor.execute(query)
+        tmpRes = mycursor.fetchall()
+        # print(f"3. {len(tmpRes)} records extracted with the following query:\n{query}")
+        for mk2 in tmpRes:
+            if mk2[1] != "E000":
+                print(f"4. {mk2}")
+                if mk not in mal_kiosks:
+                    mal_kiosks.append(mk2)
+                else:
+                    print("5. Multiple Malfunctions!!!!")
+                    mal_kiosks.append(mk2)
+    print(f"5.1. {mal_kiosks}")
+    mal_kiosks_num = len(mal_kiosks)
+    print(f"6. Malfunction kiosks: {mal_kiosks_num}")
+
+    #
+    # 2. 200대의 키오스크 중 최대 2%, 즉, 4대까지 고장이 발생한 것으로 한다.
+    #   2.1.    4대 미만의 경우 4대까지 고장을 발생시킨다.
+    #   2.2.    5대 이상 발생한 키오스크는 즉시 수리한다!
+    #
+    tnow = datetime.datetime.now()
+    tNow = tnow.strftime("%Y-%m-%d %H:%M:%S")
+    maxMalKiosksNum = 4
+    multi_mal_kiosks = set([x[0] for x in mal_kiosks if mal_kiosks.count(x[0]) > 1])
+    #  4대 미만의 경우 4대까지 고장을 발생시킨다.
+    if mal_kiosks_num < maxMalKiosksNum:
+        nRandom = random.randint(1, (maxMalKiosksNum - mal_kiosks_num))
+        query = f"SELECT kc_kiosk_id FROM g5_kiosk ORDER BY RAND() LIMIT {nRandom}"
+        mycursor.execute(query)
+        print(f"6.1 {nRandom}, {query}")
+        mk_res = mycursor.fetchall()
+        for mk in mk_res:
+            errNum = random.randint(1, 12)
+            errCode = f"E{errNum:03d}"
+            errMsg, chkMsg = error_msg(errNum)
+            mal_kiosks.append((mk[0], errCode, tNow))
+            query = (
+                "INSERT INTO g5_kiosk_status (kc_kiosk_id, kc_alarm_code, kc_alarm_msg, kc_check_msg, kc_alarm_datetime) "
+                + f"VALUES ('{mk[0]}', '{errCode}', '{errMsg}', '{chkMsg}', '{tNow}')"
+            )
+            # print(f"7. {query}")
+            mycursor.execute(query)
+            # print(f"8. {mk[0]}")
+    elif mal_kiosks_num > maxMalKiosksNum:
+        print(f"9. 중복 레코드 제거 전.... {len(mal_kiosks)}")
+        # 먼저 중복된 레코드를 찾는다.
+        tmpL = [x[0] for x in mal_kiosks]
+        tmpCnt = collections.Counter(tmpL)
+        dupL = [x for x in tmpCnt if tmpCnt[x] > 1]
+        # for 루프에 사용하기 위해서 mal_kiosks를 복제하고,
+        # 중복된 것들을 제거하기 위해 임시 리스트를 만든다.
+        tmp_kioks = []
+        mal_kiosks2 = mal_kiosks.copy()
+        for mk in mal_kiosks2:
+            if mk[0] in dupL:
+                if mk not in tmp_kiosks:
+                    tmp_kiosks.append(mk)
+                mal_kiosks.remove(mk)
+        mal_kiosks = +tmp_kiosks
+        print(f"10. 중복 레코드 제거 후.... {len(mal_kiosks)}")
+        uniq_mal_kiosks = list(set([x[0] for x in mal_kiosks]))
+        sel_mal_kiosks = random.sample(uniq_mal_kiosks, 4)
+        del_mal_kiosks = [x for x in uniq_mal_kiosks if x not in sel_mal_kiosks]
+        # 4개를 제외한 나머지 unique한 원소들을 정상으로 복구시킨다.
+        for mk in del_mal_kiosks:
+            errMsg, chkMsg = error_msg(0)
+            query = (
+                "INSERT INTO g5_kiosk_status (kc_kiosk_id, kc_alarm_code, kc_alarm_msg, kc_check_msg, kc_alarm_datetime) "
+                + f"VALUES ('{mk}', 'E000', '{errMsg}', '{chkMsg}', '{tNow}')"
+            )
+            print(f"11. {query}")
+            mycursor.execute(query)
+        for mk in mal_kiosks:
+            if mk[0] not in sel_mal_kiosks:
+                errMsg, chkMsg = error_msg(0)
+                query = (
+                    "INSERT INTO g5_kiosk_status (kc_kiosk_id, kc_alarm_code, kc_alarm_msg, kc_check_msg, kc_alarm_datetime) "
+                    + f"VALUES ('{mk[0]}', 'E000', '{errMsg}', '{chkMsg}', '{tNow}')"
+                )
+                mycursor.execute(query)
+                mal_kiosks.remove(mk)
+            elif mk[0] in dupL:
+                mal_kiosks.remove(mk)
+        print(f"12. 중복 레코드 제거 전.... {len(mal_kiosks)}")
+        # 중복된 레코드도 제거한다.
+        for mk in dupL:
+            errMsg, chkMsg = error_msg(0)
+            query = (
+                "INSERT INTO g5_kiosk_status (kc_kiosk_id, kc_alarm_code, kc_alarm_msg, kc_check_msg, kc_alarm_datetime) "
+                + f"VALUES ('{mk}', 'E000', '{errMsg}', '{chkMsg}', '{tNow}')"
+            )
+            mycursor.execute(query)
+        print(f"13. 중복 레코드 제거 후.... {len(mal_kiosks)}")
+    print(f"Malfunction kiosks.... {len(mal_kiosks)}")
+    # import pdb; pdb.set_trace()
+
+    # 3. 장애 발생 상태가 3시간 경과한 것은 무조건 정상 상태로 복구시킨다.
+    #       정상인 키오스크는 계속 상태를 업데이트 시킨다. 즉, 장애가 발생하지 않으면
+    #       kc_alarm_datetime은 상상 최신 상태로 시간만 업데이트되고,
+    #       따라서 장애 상태 레코드가 없다. 그러나 장애 이력을 확인하기 위하여
+    #       장애가 있던 상태 레코드는 추가되고 유지된다.
+    print(f"14. .... {mal_kiosks}")
+    mal_k = mal_kiosks.copy()
+    for mk in mal_k:
+        # kiosk id, alarm code, timestamp
+        query = (
+            "SELECT kc_kiosk_id, kc_alarm_code, kc_alarm_datetime "
+            + "FROM g5_kiosk_status t "
+            + f"WHERE kc_kiosk_id = '{mk[0]}' AND kc_alarm_code = '{mk[1]}' AND (SELECT kc_alarm_code FROM g5_kiosk_status "
+            + f"WHERE kc_alarm_datetime < t.kc_alarm_datetime ORDER BY kc_alarm_datetime DESC LIMIT 1) <> '{mk[1]}' "
+            + "ORDER BY kc_alarm_datetime ASC "
+            + "LIMIT 1;"
+        )
+        mycursor.execute(query)
+        mk_res = mycursor.fetchall()
+        # import pdb; pdb.set_trace()
+        # print(f'15. {idx+1} {mk[0]} : {mk[1]}, {mk[2]}')
+        # print(f"16. {idx+1} {mk_res[0][0]} : {mk_res[0][1]}, {mk[2]} ~ {mk_res[0][2]}")
+        print(f"17. {query}")
+        print(f"18 .... {mk_res}")
+        if len(mk_res) == 0:
+            continue
+        if (
+            datetime.datetime.strptime(tNow, "%Y-%m-%d %H:%M:%S") - mk_res[0][2]
+        ) > datetime.timedelta(seconds=30):
+            print(f"19. Plastichero {mk[0]} restores from {mk[1]} to E000.....")
+            errMsg, chkMsg = error_msg(0)
+            query = (
+                "INSERT INTO g5_kiosk_status (kc_kiosk_id, kc_alarm_code, kc_alarm_msg, "
+                + f"kc_check_msg, kc_alarm_datetime) VALUES ('{mk[0]}', 'E000', '{errMsg}', "
+                + f"'{chkMsg}', '{tNow}')"
+            )
+            print(f"18.1 {query}")
+            mycursor.execute(query)
+            mal_kiosks.remove(mk)
+
+    # 4. 장애 발생 상태가 아닌 키오스크는 모두 현재 시각으로 E000 코드로 업데이트한다.
+    #   4.1. 한 번이라도 장애를 발생시킨 키오스크는 장애 기록을 제외하고 최종 상태만
+    #        업데이트해야 한다(장애 이력 기록을 위하여).
+    bad_kiosks = [l[0] for l in mal_kiosks]
+    query = "SELECT kc_kiosk_id, MAX(kc_alarm_datetime) FROM g5_kiosk_status GROUP BY kc_kiosk_id;"
+    mycursor.execute(query)
+    mk_res = mycursor.fetchall()
+    for mk in mk_res:
+        # print(f"20. {mk[0]}")
+        if mk[0] not in bad_kiosks:
+            query = (
+                f"UPDATE g5_kiosk_status SET kc_alarm_datetime = '{tNow}'"
+                + f"WHERE kc_kiosk_id = '{mk[0]}' AND kc_alarm_datetime = '{mk[1]}';"
+            )
+            # 실행시킬 것
+            mycursor.execute(query)
+            # print(f"21. {query}")
+
+    # 5. 20분 간격으로 업데이트한다.
+    # time.sleep(1200)
+    print(f"22. {tNow}")
+    for mk in mal_kiosks:
+        print(f"{mk[0]}  {mk[1]}  {mk[2]}")
+    time.sleep(10)
+
+mycursor.close()
